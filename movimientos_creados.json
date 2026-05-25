@@ -1,0 +1,31 @@
+{
+    "INICIAR SALUDO": {
+        "name": "INICIAR SALUDO",
+        "sequence": [
+            "B2-SM1",
+            "B2-SM2",
+            "B2-SM3"
+        ],
+        "created_at": "2026-05-25 13:30:00",
+        "updated_at": "2026-05-25 13:30:00"
+    },
+    "DEJAR EN HOME": {
+        "name": "DEJAR EN HOME",
+        "sequence": [
+            "HOME-CH6",
+            "HOME-CH5",
+            "HOME-CH4"
+        ],
+        "created_at": "2026-05-25 13:31:00",
+        "updated_at": "2026-05-25 13:31:00"
+    },
+    "SALUDO Y HOME": {
+        "name": "SALUDO Y HOME",
+        "sequence": [
+            "INICIAR SALUDO",
+            "DEJAR EN HOME"
+        ],
+        "created_at": "2026-05-25 13:32:00",
+        "updated_at": "2026-05-25 13:32:00"
+    }
+}

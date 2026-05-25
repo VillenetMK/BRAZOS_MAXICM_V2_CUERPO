@@ -1,26 +1,81 @@
 import json
 import os
 import time
-from flask import Flask, jsonify, render_template_string, request
+from pathlib import Path
+
 import serial
+import serial.tools.list_ports
+from flask import Flask, jsonify, render_template, request
+
+
+# ===============================
+# BASE DEL PROYECTO
+# ===============================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+STEPS_FILE = BASE_DIR / "pasos_individuales.json"
+MOVEMENTS_FILE = BASE_DIR / "movimientos_creados.json"
+QUICK_ACTIONS_FILE = BASE_DIR / "acciones_rapidas.json"
+
 
 app = Flask(__name__)
+
 
 # ===============================
 # CONFIGURACIÓN SERIAL
 # ===============================
 
-SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
+
+def detectar_puerto_esp32():
+    ports = list(serial.tools.list_ports.comports())
+
+    if not ports:
+        return None
+
+    keywords = [
+        "USB",
+        "UART",
+        "CP210",
+        "CP210x",
+        "CH340",
+        "CH341",
+        "Silicon Labs",
+        "USB Serial",
+        "USB2.0-Serial",
+        "ACM",
+        "Arduino",
+        "Espressif",
+        "ESP32",
+    ]
+
+    for port in ports:
+        text = f"{port.device} {port.description} {port.manufacturer}"
+        for key in keywords:
+            if key.lower() in text.lower():
+                return port.device
+
+    for port in ports:
+        if port.device.startswith("/dev/ttyUSB") or port.device.startswith("/dev/ttyACM"):
+            return port.device
+
+    return ports[0].device
+
+
+SERIAL_PORT = detectar_puerto_esp32()
+esp32 = None
+
 try:
-    esp32 = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)
-    print(f"Conectado exitosamente al ESP32 en {SERIAL_PORT}")
+    if SERIAL_PORT:
+        esp32 = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2)
+        print(f"Conectado exitosamente al ESP32 en {SERIAL_PORT}")
+    else:
+        print("No se detectó puerto serial. Modo simulación activado.")
 except Exception as e:
-    print(
-        f"Advertencia: No se pudo conectar al ESP32 ({e}). Modo simulación activado."
-    )
+    print(f"Advertencia: No se pudo conectar al ESP32 ({e}). Modo simulación activado.")
     esp32 = None
 
 
@@ -79,65 +134,73 @@ SERVOS_CONFIG = {
     },
 }
 
-STEPS_FILE = "pasos_individuales.json"
-
 
 # ===============================
-# FUNCIONES / ACCIONES RÁPIDAS
+# JSON HELPERS
 # ===============================
-# Estas funciones usan los pasos ya creados en pasos_individuales.json.
-# Ejemplo:
-# B2-SM1 + B2-SM2 + B2-SM3 = INICIAR SALUDO
-# HOME-CH6 + HOME-CH5 + HOME-CH4 = DEJAR EN HOME
 
-QUICK_ACTIONS = {
-    "INICIAR SALUDO": [
-        "B2-SM1",
-        "B2-SM2",
-        "B2-SM3",
-    ],
-    "DEJAR EN HOME": [
-        "HOME-CH6",
-        "HOME-CH5",
-        "HOME-CH4",
-    ],
-    "SALUDO Y HOME": [
-        "B2-SM1",
-        "B2-SM2",
-        "B2-SM3",
-        "HOME-CH6",
-        "HOME-CH5",
-        "HOME-CH4",
-    ],
-}
+def load_json_file(path):
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            content = file.read().strip()
+
+            if not content:
+                return {}
+
+            return json.loads(content)
+
+    except json.JSONDecodeError:
+        print(f"ERROR: JSON inválido en {path}")
+        return {}
 
 
-# ===============================
-# MANEJO DE ARCHIVO JSON
-# ===============================
+def save_json_file(path, data):
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4, ensure_ascii=False)
+
 
 def load_steps():
-    if os.path.exists(STEPS_FILE):
-        with open(STEPS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return load_json_file(STEPS_FILE)
 
 
 def save_steps(steps):
-    with open(STEPS_FILE, "w", encoding="utf-8") as f:
-        json.dump(steps, f, indent=4, ensure_ascii=False)
+    save_json_file(STEPS_FILE, steps)
+
+
+def load_movements():
+    return load_json_file(MOVEMENTS_FILE)
+
+
+def save_movements(movements):
+    save_json_file(MOVEMENTS_FILE, movements)
+
+
+def load_quick_actions():
+    return load_json_file(QUICK_ACTIONS_FILE)
+
+
+def save_quick_actions(actions):
+    save_json_file(QUICK_ACTIONS_FILE, actions)
 
 
 # ===============================
-# COMUNICACIÓN CON ESP32
+# COMUNICACIÓN ESP32
 # ===============================
 
 def enviar_comando(comando):
     if esp32 and esp32.is_open:
-        esp32.write(f"{comando}\n".encode())
+        esp32.write(f"{comando}\n".encode("utf-8"))
         print(f"Enviado a ESP32: {comando}")
     else:
         print(f"[Simulación] Comando: {comando}")
+
+
+def limitar_angulo(channel, angle):
+    config = SERVOS_CONFIG[channel]
+    return max(config["min"], min(config["max"], int(angle)))
 
 
 def calcular_movimiento_suave(channel, nuevo_angulo, custom_interval=None):
@@ -151,11 +214,6 @@ def calcular_movimiento_suave(channel, nuevo_angulo, custom_interval=None):
 
     tiempo_estimado_ms = diferencia_pulsos * intervalo
     return tiempo_estimado_ms / 1000.0
-
-
-def limitar_angulo(channel, angle):
-    config = SERVOS_CONFIG[channel]
-    return max(config["min"], min(config["max"], int(angle)))
 
 
 def ejecutar_paso_individual(step_data):
@@ -192,8 +250,13 @@ def ejecutar_home_general():
     return max(tiempos_home) if tiempos_home else 1
 
 
-def ejecutar_lista_pasos(sequence_names):
+def ejecutar_lista_pasos(sequence_names, visited=None):
+    if visited is None:
+        visited = set()
+
     steps = load_steps()
+    movements = load_movements()
+    quick_actions = load_quick_actions()
 
     for name in sequence_names:
         if name == "[ IR A HOME COMIENZO ]":
@@ -201,8 +264,20 @@ def ejecutar_lista_pasos(sequence_names):
             time.sleep(tiempo_home)
             continue
 
-        if name in QUICK_ACTIONS:
-            ejecutar_lista_pasos(QUICK_ACTIONS[name])
+        if name in visited:
+            print(f"Advertencia: referencia circular detectada en {name}. Se omitió.")
+            continue
+
+        if name in quick_actions:
+            visited.add(name)
+            ejecutar_lista_pasos(quick_actions[name]["sequence"], visited)
+            visited.remove(name)
+            continue
+
+        if name in movements:
+            visited.add(name)
+            ejecutar_lista_pasos(movements[name]["sequence"], visited)
+            visited.remove(name)
             continue
 
         if name in steps:
@@ -219,25 +294,28 @@ def ejecutar_lista_pasos(sequence_names):
 
             time.sleep(tiempo_total)
         else:
-            print(f"Advertencia: paso no encontrado: {name}")
+            print(f"Advertencia: paso/movimiento/acción no encontrado: {name}")
 
 
 # ===============================
-# RUTAS FLASK
+# RUTAS WEB
 # ===============================
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_INTERFACE)
+    return render_template("index.html")
 
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
     return jsonify(
         {
+            "serial_port": SERIAL_PORT,
+            "serial_connected": bool(esp32 and esp32.is_open),
             "servos": SERVOS_CONFIG,
             "steps": load_steps(),
-            "quick_actions": QUICK_ACTIONS,
+            "movements": load_movements(),
+            "quick_actions": load_quick_actions(),
         }
     )
 
@@ -245,6 +323,7 @@ def get_status():
 @app.route("/api/move", methods=["POST"])
 def move_servo():
     data = request.json
+
     channel = int(data["channel"])
     action = data["action"]
 
@@ -278,14 +357,22 @@ def go_home():
     return jsonify({"status": "success"})
 
 
+# ===============================
+# PASOS INDIVIDUALES
+# ===============================
+
 @app.route("/api/steps", methods=["POST"])
 def save_step():
     data = request.json
-    step_name = data["name"]
+
+    step_name = data.get("name", "").strip()
     channel = int(data["channel"])
     angle = limitar_angulo(channel, int(data["angle"]))
     interval = int(data.get("interval", 5))
     delay = float(data.get("delay", 0.5))
+
+    if not step_name:
+        return jsonify({"status": "error", "message": "Nombre vacío"}), 400
 
     steps = load_steps()
     steps[step_name] = {
@@ -296,13 +383,15 @@ def save_step():
     }
 
     save_steps(steps)
+
     return jsonify({"status": "success", "steps": steps})
 
 
 @app.route("/api/steps/delete", methods=["POST"])
 def delete_step():
     data = request.json
-    step_name = data["name"]
+    step_name = data.get("name", "").strip()
+
     steps = load_steps()
 
     if step_name in steps:
@@ -316,7 +405,8 @@ def delete_step():
 @app.route("/api/steps/run_single", methods=["POST"])
 def run_single_step():
     data = request.json
-    step_name = data["name"]
+    step_name = data.get("name", "").strip()
+
     steps = load_steps()
 
     if step_name in steps:
@@ -331,6 +421,10 @@ def run_single_step():
     return jsonify({"status": "error", "message": "Paso no encontrado"}), 400
 
 
+# ===============================
+# SECUENCIA GENERAL
+# ===============================
+
 @app.route("/api/sequence/run", methods=["POST"])
 def run_sequence():
     data = request.json
@@ -341,711 +435,162 @@ def run_sequence():
     return jsonify({"status": "success"})
 
 
-@app.route("/api/quick_actions", methods=["GET"])
-def get_quick_actions():
-    return jsonify({"quick_actions": QUICK_ACTIONS})
+# ===============================
+# MOVIMIENTOS CREADOS
+# ===============================
+
+@app.route("/api/movements/save", methods=["POST"])
+def save_movement():
+    data = request.json
+
+    movement_name = data.get("name", "").strip()
+    sequence = data.get("sequence", [])
+    mode = data.get("mode", "replace")
+
+    if not movement_name:
+        return jsonify({"status": "error", "message": "Nombre vacío"}), 400
+
+    if not sequence:
+        return jsonify({"status": "error", "message": "Secuencia vacía"}), 400
+
+    movements = load_movements()
+
+    if mode == "keep" and movement_name in movements:
+        return jsonify(
+            {
+                "status": "exists",
+                "message": "El movimiento ya existe y se mantuvo sin cambios",
+                "movements": movements,
+            }
+        )
+
+    if mode == "append" and movement_name in movements:
+        old_sequence = movements[movement_name].get("sequence", [])
+        movements[movement_name]["sequence"] = old_sequence + sequence
+        movements[movement_name]["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        movements[movement_name] = {
+            "name": movement_name,
+            "sequence": sequence,
+            "created_at": movements.get(movement_name, {}).get(
+                "created_at",
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    save_movements(movements)
+
+    return jsonify({"status": "success", "movements": movements})
+
+
+@app.route("/api/movements/delete", methods=["POST"])
+def delete_movement():
+    data = request.json
+    movement_name = data.get("name", "").strip()
+
+    movements = load_movements()
+
+    if movement_name in movements:
+        del movements[movement_name]
+        save_movements(movements)
+        return jsonify({"status": "success", "movements": movements})
+
+    return jsonify({"status": "error", "message": "Movimiento no encontrado"}), 400
+
+
+@app.route("/api/movements/run", methods=["POST"])
+def run_movement():
+    data = request.json
+    movement_name = data.get("name", "").strip()
+
+    movements = load_movements()
+
+    if movement_name not in movements:
+        return jsonify({"status": "error", "message": "Movimiento no encontrado"}), 400
+
+    ejecutar_lista_pasos(movements[movement_name]["sequence"])
+
+    return jsonify({"status": "success", "movement": movement_name})
+
+
+# ===============================
+# ACCIONES RÁPIDAS EDITABLES
+# ===============================
+
+@app.route("/api/quick_actions/save", methods=["POST"])
+def save_quick_action():
+    data = request.json
+
+    action_name = data.get("name", "").strip()
+    sequence = data.get("sequence", [])
+    mode = data.get("mode", "replace")
+
+    if not action_name:
+        return jsonify({"status": "error", "message": "Nombre vacío"}), 400
+
+    if not sequence:
+        return jsonify({"status": "error", "message": "Secuencia vacía"}), 400
+
+    actions = load_quick_actions()
+
+    if mode == "keep" and action_name in actions:
+        return jsonify(
+            {
+                "status": "exists",
+                "message": "La acción rápida ya existe y se mantuvo sin cambios",
+                "quick_actions": actions,
+            }
+        )
+
+    if mode == "append" and action_name in actions:
+        old_sequence = actions[action_name].get("sequence", [])
+        actions[action_name]["sequence"] = old_sequence + sequence
+        actions[action_name]["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        actions[action_name] = {
+            "name": action_name,
+            "sequence": sequence,
+            "created_at": actions.get(action_name, {}).get(
+                "created_at",
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    save_quick_actions(actions)
+
+    return jsonify({"status": "success", "quick_actions": actions})
+
+
+@app.route("/api/quick_actions/delete", methods=["POST"])
+def delete_quick_action():
+    data = request.json
+    action_name = data.get("name", "").strip()
+
+    actions = load_quick_actions()
+
+    if action_name in actions:
+        del actions[action_name]
+        save_quick_actions(actions)
+        return jsonify({"status": "success", "quick_actions": actions})
+
+    return jsonify({"status": "error", "message": "Acción rápida no encontrada"}), 400
 
 
 @app.route("/api/quick_actions/run", methods=["POST"])
 def run_quick_action():
     data = request.json
-    action_name = data.get("name")
+    action_name = data.get("name", "").strip()
 
-    if action_name not in QUICK_ACTIONS:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Acción rápida no encontrada",
-            }
-        ), 400
+    actions = load_quick_actions()
 
-    ejecutar_lista_pasos(QUICK_ACTIONS[action_name])
+    if action_name not in actions:
+        return jsonify({"status": "error", "message": "Acción rápida no encontrada"}), 400
 
-    return jsonify(
-        {
-            "status": "success",
-            "action": action_name,
-        }
-    )
+    ejecutar_lista_pasos(actions[action_name]["sequence"])
 
-
-# ===============================
-# INTERFAZ WEB
-# ===============================
-
-HTML_INTERFACE = """
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Control Secuencial Motor a Motor</title>
-
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            background: #f0f2f5;
-            margin: 0;
-            padding: 20px;
-            color: #333;
-        }
-
-        .container {
-            max-width: 1100px;
-            margin: 0 auto;
-        }
-
-        h1, h2 {
-            text-align: center;
-            color: #2c3e50;
-            margin-top: 5px;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-        }
-
-        @media(max-width: 768px) {
-            .grid {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        .card {
-            background: white;
-            padding: 20px;
-            border-radius: 12px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-
-        .servo-control {
-            border-bottom: 1px solid #eee;
-            padding: 12px 0;
-        }
-
-        .servo-header {
-            display: flex;
-            justify-content: space-between;
-            font-weight: bold;
-            color: #34495e;
-        }
-
-        .controls {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-top: 5px;
-        }
-
-        button {
-            color: white;
-            border: none;
-            padding: 8px 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        .btn-blue {
-            background: #3498db;
-        }
-
-        .btn-blue:hover {
-            background: #2980b9;
-        }
-
-        .btn-orange {
-            background: #e67e22;
-        }
-
-        .btn-orange:hover {
-            background: #d35400;
-        }
-
-        .btn-green {
-            background: #2ecc71;
-        }
-
-        .btn-green:hover {
-            background: #27ae60;
-        }
-
-        .btn-red {
-            background: #e74c3c;
-        }
-
-        .btn-red:hover {
-            background: #c0392b;
-        }
-
-        .btn-purple {
-            background: #9b59b6;
-        }
-
-        .btn-purple:hover {
-            background: #8e44ad;
-        }
-
-        .btn-dark {
-            background: #34495e;
-        }
-
-        .btn-dark:hover {
-            background: #2c3e50;
-        }
-
-        input[type="range"] {
-            flex-grow: 1;
-        }
-
-        .pose-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }
-
-        .pose-table th,
-        .pose-table td {
-            border: 1px solid #ddd;
-            padding: 10px;
-            text-align: center;
-        }
-
-        .pose-table th {
-            background-color: #f4f6f7;
-        }
-
-        .pose-table input {
-            text-align: center;
-            padding: 4px;
-            border-radius: 4px;
-            border: 1px solid #ccc;
-        }
-
-        .info-box {
-            background: #e8f4fd;
-            border-left: 4px solid #3498db;
-            padding: 12px;
-            margin-bottom: 15px;
-            border-radius: 0 6px 6px 0;
-            text-align: center;
-            font-weight: bold;
-        }
-
-        .seq-builder {
-            background: #fdfefe;
-            border: 2px dashed #bdc3c7;
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-            margin-top: 10px;
-        }
-
-        .creator-row {
-            display: flex;
-            gap: 10px;
-            background: #f9f9f9;
-            padding: 15px;
-            border-radius: 8px;
-            border: 1px solid #e0e0e0;
-            margin-bottom: 15px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        .quick-actions-box {
-            margin-bottom: 20px;
-            padding: 15px;
-            background: #f4f6f7;
-            border-radius: 8px;
-            border: 1px solid #ddd;
-        }
-
-        .quick-actions-title {
-            margin-top: 0;
-            text-align: center;
-            color: #2c3e50;
-        }
-
-        .quick-actions-container {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            justify-content: center;
-        }
-
-        .quick-action-group {
-            display: flex;
-            gap: 5px;
-            align-items: center;
-            background: white;
-            padding: 8px;
-            border-radius: 8px;
-            border: 1px solid #ddd;
-        }
-
-        .queue-item {
-            background: #ecf0f1;
-            padding: 6px 10px;
-            border-radius: 6px;
-            margin: 3px;
-            display: inline-block;
-        }
-    </style>
-</head>
-
-<body>
-    <div class="container">
-        <h1>🤖 Secuenciador de Motores Individuales</h1>
-
-        <div id="info-global" class="info-box">
-            Última acción: Esperando comandos...
-        </div>
-
-        <div style="text-align: center; margin-bottom: 20px;">
-            <button class="btn-purple" style="font-size: 1.1em; padding: 10px 25px;" onclick="irAHomeGlobal()">
-                🏠 ENVIAR TODO A HOME
-            </button>
-        </div>
-
-        <div class="grid">
-            <div class="card">
-                <h2>👈 Brazo 1 (Izquierdo)</h2>
-                <div id="brazo1-container"></div>
-            </div>
-
-            <div class="card">
-                <h2>👉 Brazo 2 (Derecho)</h2>
-                <div id="brazo2-container"></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>💾 Biblioteca de Pasos (Motor Único)</h2>
-
-            <div class="creator-row">
-                <input
-                    type="text"
-                    id="step-name"
-                    placeholder="Nombre del paso (Ej: B2-SM1)"
-                    style="flex-grow: 2; padding: 8px;"
-                >
-
-                <select id="step-channel" style="padding: 8px;" onchange="actualizarAnguloSugerido()">
-                    <option value="0">Ch 0 - Brazo 1 Hombro</option>
-                    <option value="1">Ch 1 - Brazo 1 Codo Rot</option>
-                    <option value="2">Ch 2 - Brazo 1 Codo Vert</option>
-                    <option value="4">Ch 4 - Brazo 2 Hombro</option>
-                    <option value="5">Ch 5 - Brazo 2 Codo Rot</option>
-                    <option value="6">Ch 6 - Brazo 2 Codo Vert</option>
-                </select>
-
-                <div style="display: flex; align-items: center; gap: 5px;">
-                    <label>Ángulo:</label>
-                    <input type="number" id="step-angle" style="width: 60px; padding: 6px;">°
-                </div>
-
-                <div style="display: flex; align-items: center; gap: 5px;">
-                    <label>Velocidad:</label>
-                    <input type="number" id="step-interval" value="5" style="width: 50px; padding: 6px;"> ms
-                </div>
-
-                <div style="display: flex; align-items: center; gap: 5px;">
-                    <label>Retardo:</label>
-                    <input type="number" id="step-delay" value="0.5" step="0.1" style="width: 50px; padding: 6px;"> s
-                </div>
-
-                <button class="btn-green" onclick="crearPaso()">
-                    Crear / Modificar Paso
-                </button>
-            </div>
-
-            <table class="pose-table">
-                <thead>
-                    <tr>
-                        <th>Identificador del Paso</th>
-                        <th>Motor / Canal</th>
-                        <th>Ángulo Destino</th>
-                        <th>Velocidad (ms/paso)</th>
-                        <th>Retardo (s)</th>
-                        <th>Acciones</th>
-                    </tr>
-                </thead>
-                <tbody id="steps-table-body"></tbody>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>⛓️ Constructor de Rutas e Historial Secuencial</h2>
-
-            <p style="font-size: 0.9em; color: #666;">
-                Ejecuta funciones completas o arma una ruta manual con pasos guardados.
-            </p>
-
-            <div class="quick-actions-box">
-                <h3 class="quick-actions-title">⚡ Funciones rápidas</h3>
-
-                <p style="font-size: 0.9em; color: #666; text-align:center;">
-                    Usa estos botones para ejecutar una opción completa sin seleccionar bloques uno por uno.
-                </p>
-
-                <div id="quick-actions-container" class="quick-actions-container">
-                </div>
-            </div>
-
-            <div class="seq-builder">
-                <div style="margin-bottom: 10px;">
-                    <button class="btn-dark" onclick="agregarACola('[ IR A HOME COMIENZO ]')">
-                        + Añadir Reset a Home
-                    </button>
-                </div>
-
-                <div
-                    id="sequence-queue"
-                    style="font-weight: bold; margin-bottom: 15px; font-size: 1.1em; color: #2c3e50; border: 1px solid #ddd; padding: 10px; background: #fcfcfc;"
-                >
-                    [ Secuencia Vacía ]
-                </div>
-
-                <button class="btn-green" style="font-size: 1.2em; padding: 12px 25px;" onclick="ejecutarSecuencia()">
-                    ▶️ LANZAR SECUENCIA DE PASOS
-                </button>
-
-                <button class="btn-red" onclick="limpiarSecuencia()">
-                    Limpiar Orden
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let listaSecuencia = [];
-        let servosCached = {};
-        let quickActionsCached = {};
-
-        async function actualizarEstado() {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-
-            servosCached = data.servos;
-            quickActionsCached = data.quick_actions;
-
-            renderBrazo([0, 1, 2], 'brazo1-container', data.servos);
-            renderBrazo([4, 5, 6], 'brazo2-container', data.servos);
-            renderTablaPasos(data.steps);
-            renderAccionesRapidas(data.quick_actions);
-        }
-
-        function renderBrazo(canales, containerId, servos) {
-            const container = document.getElementById(containerId);
-            container.innerHTML = '';
-
-            canales.forEach(ch => {
-                const s = servos[ch];
-
-                container.innerHTML += `
-                    <div class="servo-control">
-                        <div class="servo-header">
-                            <span>${s.name} (Ch ${ch})</span>
-                            <span style="color:#3498db" id="val-display-${ch}">${s.current}°</span>
-                        </div>
-
-                        <div class="controls">
-                            <button class="btn-orange" onclick="mover(${ch}, 'step_down')">-1°</button>
-
-                            <input
-                                type="range"
-                                min="${s.min}"
-                                max="${s.max}"
-                                value="${s.current}"
-                                id="slider-${ch}"
-                                onchange="mover(${ch}, 'angle', this.value)"
-                                oninput="document.getElementById('val-display-${ch}').innerText = this.value + '°'"
-                            >
-
-                            <button class="btn-orange" onclick="mover(${ch}, 'step_up')">+1°</button>
-                        </div>
-                    </div>
-                `;
-            });
-        }
-
-        function actualizarAnguloSugerido() {
-            const ch = document.getElementById('step-channel').value;
-
-            if (servosCached[ch]) {
-                document.getElementById('step-angle').value = servosCached[ch].current;
-            }
-        }
-
-        function renderTablaPasos(steps) {
-            const tbody = document.getElementById('steps-table-body');
-            tbody.innerHTML = '';
-
-            Object.keys(steps).forEach(name => {
-                const s = steps[name];
-                const motorName = servosCached[s.channel]
-                    ? servosCached[s.channel].name
-                    : `Canal ${s.channel}`;
-
-                tbody.innerHTML += `
-                    <tr>
-                        <td style="font-weight:bold; color: #2c3e50;">${name}</td>
-                        <td>${motorName} (Ch ${s.channel})</td>
-                        <td><b style="color:#27ae60">${s.angle}°</b></td>
-
-                        <td>
-                            <input
-                                type="number"
-                                style="width:50px"
-                                value="${s.interval}"
-                                onchange="modificarFila('${name}', 'interval', this.value)"
-                            > ms
-                        </td>
-
-                        <td>
-                            <input
-                                type="number"
-                                style="width:50px"
-                                step="0.1"
-                                value="${s.delay}"
-                                onchange="modificarFila('${name}', 'delay', this.value)"
-                            > s
-                        </td>
-
-                        <td>
-                            <button class="btn-blue" onclick="ejecutarPasoUnico('${name}')">
-                                Probar
-                            </button>
-
-                            <button class="btn-purple" onclick="agregarACola('${name}')">
-                                + Secuencia
-                            </button>
-
-                            <button class="btn-red" onclick="eliminarPaso('${name}')">
-                                🗑️
-                            </button>
-                        </td>
-                    </tr>
-                `;
-            });
-        }
-
-        function renderAccionesRapidas(quickActions) {
-            const container = document.getElementById('quick-actions-container');
-            container.innerHTML = '';
-
-            Object.keys(quickActions).forEach(actionName => {
-                const stepsText = quickActions[actionName].join(' ➔ ');
-
-                container.innerHTML += `
-                    <div class="quick-action-group">
-                        <button class="btn-green" onclick="ejecutarAccionRapida('${actionName}')">
-                            ▶️ ${actionName}
-                        </button>
-
-                        <button class="btn-blue" onclick="agregarAccionRapidaACola('${actionName}')">
-                            + Ruta
-                        </button>
-
-                        <span style="font-size: 0.8em; color: #666;">
-                            ${stepsText}
-                        </span>
-                    </div>
-                `;
-            });
-        }
-
-        async function mover(channel, action, value = 0) {
-            const res = await fetch('/api/move', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({channel, action, value})
-            });
-
-            const data = await res.json();
-
-            if (data.status === 'success') {
-                document.getElementById(`slider-${channel}`).value = data.current_angle;
-                document.getElementById(`val-display-${channel}`).innerText = data.current_angle + "°";
-                document.getElementById('info-global').innerHTML =
-                    `Movimiento Manual: Canal ${channel} -> ${data.current_angle}°.`;
-
-                actualizarAnguloSugerido();
-            }
-        }
-
-        async function irAHomeGlobal() {
-            await fetch('/api/home', {method: 'POST'});
-
-            document.getElementById('info-global').innerText =
-                "Todos los brazos reposicionados en Home.";
-
-            actualizarEstado();
-        }
-
-        async function crearPaso() {
-            const name = document.getElementById('step-name').value.trim();
-            const channel = document.getElementById('step-channel').value;
-            const angle = document.getElementById('step-angle').value;
-            const interval = document.getElementById('step-interval').value;
-            const delay = document.getElementById('step-delay').value;
-
-            if (!name) {
-                return alert("Por favor escribe un nombre para identificar el paso.");
-            }
-
-            if (angle === "") {
-                return alert("Especifica un ángulo.");
-            }
-
-            await fetch('/api/steps', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    name,
-                    channel,
-                    angle: parseInt(angle),
-                    interval: parseInt(interval),
-                    delay: parseFloat(delay)
-                })
-            });
-
-            document.getElementById('step-name').value = '';
-
-            actualizarEstado();
-        }
-
-        async function modificarFila(name, campo, valor) {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            const paso = data.steps[name];
-
-            paso[campo] = campo === 'interval'
-                ? parseInt(valor)
-                : parseFloat(valor);
-
-            await fetch('/api/steps', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    name: name,
-                    channel: paso.channel,
-                    angle: paso.angle,
-                    interval: paso.interval,
-                    delay: paso.delay
-                })
-            });
-        }
-
-        async function eliminarPaso(name) {
-            await fetch('/api/steps/delete', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name})
-            });
-
-            actualizarEstado();
-        }
-
-        async function ejecutarPasoUnico(name) {
-            const res = await fetch('/api/steps/run_single', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name})
-            });
-
-            const data = await res.json();
-
-            document.getElementById('info-global').innerHTML =
-                `Probando paso [${name}]. Tiempo de tránsito: ~<b>${data.estimated_time_seconds}s</b>`;
-
-            actualizarEstado();
-        }
-
-        async function ejecutarAccionRapida(actionName) {
-            const confirmar = confirm(`¿Ejecutar función rápida: ${actionName}?`);
-
-            if (!confirmar) return;
-
-            document.getElementById('info-global').innerHTML =
-                `⏳ <b>Ejecutando función rápida: ${actionName}</b>`;
-
-            const res = await fetch('/api/quick_actions/run', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name: actionName})
-            });
-
-            const data = await res.json();
-
-            if (data.status === 'success') {
-                document.getElementById('info-global').innerHTML =
-                    `✅ <b>Función rápida finalizada: ${actionName}</b>`;
-            } else {
-                document.getElementById('info-global').innerHTML =
-                    `❌ Error ejecutando función rápida: ${actionName}`;
-            }
-
-            actualizarEstado();
-        }
-
-        function agregarACola(name) {
-            listaSecuencia.push(name);
-            actualizarVisualizacionCola();
-        }
-
-        function agregarAccionRapidaACola(actionName) {
-            listaSecuencia.push(actionName);
-            actualizarVisualizacionCola();
-        }
-
-        function limpiarSecuencia() {
-            listaSecuencia = [];
-            actualizarVisualizacionCola();
-        }
-
-        function actualizarVisualizacionCola() {
-            const q = document.getElementById('sequence-queue');
-
-            if (listaSecuencia.length === 0) {
-                q.innerText = "[ Secuencia Vacía ]";
-                return;
-            }
-
-            q.innerHTML = listaSecuencia
-                .map(item => `<span class="queue-item">${item}</span>`)
-                .join(" ➔ ");
-        }
-
-        async function ejecutarSecuencia() {
-            if (listaSecuencia.length === 0) {
-                return alert("Añade pasos o funciones a la secuencia primero.");
-            }
-
-            document.getElementById('info-global').innerHTML =
-                "⏳ <b>Ejecutando ruta/secuencia en el robot...</b>";
-
-            await fetch('/api/sequence/run', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({sequence: listaSecuencia})
-            });
-
-            document.getElementById('info-global').innerHTML =
-                "✅ <b>Secuencia finalizada correctamente.</b>";
-
-            actualizarEstado();
-        }
-
-        actualizarEstado();
-    </script>
-</body>
-</html>
-"""
+    return jsonify({"status": "success", "action": action_name})
 
 
 # ===============================
