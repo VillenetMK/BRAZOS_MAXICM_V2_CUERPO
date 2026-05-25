@@ -69,9 +69,14 @@ h3 {
     text-align: center;
 }
 
+/* CONTROLES DE SERVOS: NO QUITAR */
 .servo-control {
     border-bottom: 1px solid #eee;
-    padding: 12px 0;
+    padding: 14px 0;
+}
+
+.servo-control:last-child {
+    border-bottom: none;
 }
 
 .servo-header {
@@ -79,17 +84,24 @@ h3 {
     justify-content: space-between;
     font-weight: bold;
     color: #34495e;
+    margin-bottom: 8px;
+}
+
+.servo-angle {
+    color: #2e86de;
+    font-weight: bold;
 }
 
 .controls {
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-top: 5px;
 }
 
-input[type="range"] {
+.controls input[type="range"] {
     flex-grow: 1;
+    height: 6px;
+    cursor: pointer;
 }
 
 button {

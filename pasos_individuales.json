@@ -2,37 +2,37 @@
     "B2-SM1": {
         "channel": 4,
         "angle": 270,
-        "interval": 5,
+        "interval": 3,
         "delay": 0.2
     },
     "B2-SM2": {
         "channel": 5,
         "angle": 0,
-        "interval": 3,
+        "interval": 1,
         "delay": 0.2
     },
     "B2-SM3": {
         "channel": 6,
         "angle": 45,
-        "interval": 5,
+        "interval": 2,
         "delay": 0.5
     },
-    "HOME-CH6": {
-        "channel": 6,
-        "angle": 0,
-        "interval": 5,
+    "HOME-CH4": {
+        "channel": 4,
+        "angle": 135,
+        "interval": 10,
         "delay": 0.2
     },
     "HOME-CH5": {
         "channel": 5,
         "angle": 60,
-        "interval": 2,
+        "interval": 10,
         "delay": 0.2
     },
-    "HOME-CH4": {
-        "channel": 4,
-        "angle": 135,
-        "interval": 5,
+    "HOME-CH6": {
+        "channel": 6,
+        "angle": 0,
+        "interval": 15,
         "delay": 0.2
     }
 }

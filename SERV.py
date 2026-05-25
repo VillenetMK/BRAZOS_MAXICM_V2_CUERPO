@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import threading
 from pathlib import Path
 
 import serial
@@ -18,7 +19,6 @@ STEPS_FILE = BASE_DIR / "pasos_individuales.json"
 MOVEMENTS_FILE = BASE_DIR / "movimientos_creados.json"
 QUICK_ACTIONS_FILE = BASE_DIR / "acciones_rapidas.json"
 
-
 app = Flask(__name__)
 
 
@@ -27,6 +27,7 @@ app = Flask(__name__)
 # ===============================
 
 BAUD_RATE = 115200
+serial_lock = threading.Lock()
 
 
 def detectar_puerto_esp32():
@@ -77,6 +78,45 @@ try:
 except Exception as e:
     print(f"Advertencia: No se pudo conectar al ESP32 ({e}). Modo simulación activado.")
     esp32 = None
+
+
+# ===============================
+# CONTROL DE SECUENCIAS EN SEGUNDO PLANO
+# ===============================
+
+sequence_running = False
+sequence_lock = threading.Lock()
+
+
+def ejecutar_lista_pasos_background(sequence_names):
+    global sequence_running
+
+    try:
+        ejecutar_lista_pasos(sequence_names)
+    except Exception as e:
+        print(f"ERROR ejecutando secuencia en segundo plano: {e}")
+    finally:
+        with sequence_lock:
+            sequence_running = False
+
+
+def iniciar_secuencia_background(sequence_names):
+    global sequence_running
+
+    with sequence_lock:
+        if sequence_running:
+            return False
+
+        sequence_running = True
+
+    hilo = threading.Thread(
+        target=ejecutar_lista_pasos_background,
+        args=(sequence_names,),
+        daemon=True,
+    )
+
+    hilo.start()
+    return True
 
 
 # ===============================
@@ -191,11 +231,12 @@ def save_quick_actions(actions):
 # ===============================
 
 def enviar_comando(comando):
-    if esp32 and esp32.is_open:
-        esp32.write(f"{comando}\n".encode("utf-8"))
-        print(f"Enviado a ESP32: {comando}")
-    else:
-        print(f"[Simulación] Comando: {comando}")
+    with serial_lock:
+        if esp32 and esp32.is_open:
+            esp32.write(f"{comando}\n".encode("utf-8"))
+            print(f"Enviado a ESP32: {comando}")
+        else:
+            print(f"[Simulación] Comando: {comando}")
 
 
 def limitar_angulo(channel, angle):
@@ -312,6 +353,7 @@ def get_status():
         {
             "serial_port": SERIAL_PORT,
             "serial_connected": bool(esp32 and esp32.is_open),
+            "sequence_running": sequence_running,
             "servos": SERVOS_CONFIG,
             "steps": load_steps(),
             "movements": load_movements(),
@@ -353,8 +395,22 @@ def move_servo():
 
 @app.route("/api/home", methods=["POST"])
 def go_home():
-    ejecutar_home_general()
-    return jsonify({"status": "success"})
+    started = iniciar_secuencia_background(["[ IR A HOME COMIENZO ]"])
+
+    if not started:
+        return jsonify(
+            {
+                "status": "busy",
+                "message": "Ya hay una secuencia ejecutándose",
+            }
+        ), 409
+
+    return jsonify(
+        {
+            "status": "started",
+            "message": "Home enviado al robot",
+        }
+    )
 
 
 # ===============================
@@ -410,11 +466,20 @@ def run_single_step():
     steps = load_steps()
 
     if step_name in steps:
-        tiempo_viaje = ejecutar_paso_individual(steps[step_name])
+        started = iniciar_secuencia_background([step_name])
+
+        if not started:
+            return jsonify(
+                {
+                    "status": "busy",
+                    "message": "Ya hay una secuencia ejecutándose",
+                }
+            ), 409
+
         return jsonify(
             {
-                "status": "success",
-                "estimated_time_seconds": round(tiempo_viaje, 3),
+                "status": "started",
+                "message": "Paso enviado al robot",
             }
         )
 
@@ -430,9 +495,25 @@ def run_sequence():
     data = request.json
     sequence_names = data.get("sequence", [])
 
-    ejecutar_lista_pasos(sequence_names)
+    if not sequence_names:
+        return jsonify({"status": "error", "message": "Secuencia vacía"}), 400
 
-    return jsonify({"status": "success"})
+    started = iniciar_secuencia_background(sequence_names)
+
+    if not started:
+        return jsonify(
+            {
+                "status": "busy",
+                "message": "Ya hay una secuencia ejecutándose",
+            }
+        ), 409
+
+    return jsonify(
+        {
+            "status": "started",
+            "message": "Secuencia enviada al robot",
+        }
+    )
 
 
 # ===============================
@@ -509,9 +590,23 @@ def run_movement():
     if movement_name not in movements:
         return jsonify({"status": "error", "message": "Movimiento no encontrado"}), 400
 
-    ejecutar_lista_pasos(movements[movement_name]["sequence"])
+    started = iniciar_secuencia_background(movements[movement_name]["sequence"])
 
-    return jsonify({"status": "success", "movement": movement_name})
+    if not started:
+        return jsonify(
+            {
+                "status": "busy",
+                "message": "Ya hay una secuencia ejecutándose",
+            }
+        ), 409
+
+    return jsonify(
+        {
+            "status": "started",
+            "movement": movement_name,
+            "message": "Movimiento enviado al robot",
+        }
+    )
 
 
 # ===============================
@@ -588,9 +683,23 @@ def run_quick_action():
     if action_name not in actions:
         return jsonify({"status": "error", "message": "Acción rápida no encontrada"}), 400
 
-    ejecutar_lista_pasos(actions[action_name]["sequence"])
+    started = iniciar_secuencia_background(actions[action_name]["sequence"])
 
-    return jsonify({"status": "success", "action": action_name})
+    if not started:
+        return jsonify(
+            {
+                "status": "busy",
+                "message": "Ya hay una secuencia ejecutándose",
+            }
+        ), 409
+
+    return jsonify(
+        {
+            "status": "started",
+            "action": action_name,
+            "message": "Acción rápida enviada al robot",
+        }
+    )
 
 
 # ===============================
@@ -598,4 +707,10 @@ def run_quick_action():
 # ===============================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True,
+        use_reloader=False,
+        threaded=True,
+    )
