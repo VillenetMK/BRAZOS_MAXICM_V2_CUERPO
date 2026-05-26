@@ -300,42 +300,60 @@ def ejecutar_lista_pasos(sequence_names, visited=None):
     quick_actions = load_quick_actions()
 
     for name in sequence_names:
+
+        # HOME especial
         if name == "[ IR A HOME COMIENZO ]":
-            tiempo_home = ejecutar_home_general()
-            time.sleep(tiempo_home)
+            ejecutar_home_general()
             continue
 
+        # Evita bucle infinito si una acción se llama a sí misma
         if name in visited:
             print(f"Advertencia: referencia circular detectada en {name}. Se omitió.")
             continue
 
+        # Acción rápida desde acciones_rapidas.json
         if name in quick_actions:
             visited.add(name)
-            ejecutar_lista_pasos(quick_actions[name]["sequence"], visited)
+            ejecutar_lista_pasos(quick_actions[name].get("sequence", []), visited)
             visited.remove(name)
             continue
 
+        # Movimiento creado desde movimientos_creados.json
         if name in movements:
             visited.add(name)
-            ejecutar_lista_pasos(movements[name]["sequence"], visited)
+            ejecutar_lista_pasos(movements[name].get("sequence", []), visited)
             visited.remove(name)
             continue
 
+        # Paso individual desde pasos_individuales.json
         if name in steps:
             step_data = steps[name]
-            retardo_extra = float(step_data.get("delay", 0.5))
 
-            tiempo_viaje = ejecutar_paso_individual(step_data)
-            tiempo_total = tiempo_viaje + retardo_extra
+            channel = int(step_data["channel"])
+            angle = int(step_data["angle"])
+            interval = int(step_data.get("interval", 5))
+            delay = float(step_data.get("delay", 0))
+
+            angle = limitar_angulo(channel, angle)
 
             print(
-                f"Secuencia -> Paso {name}, canal {step_data['channel']}. "
-                f"Esperando {round(tiempo_total, 2)}s"
+                f"JSON directo -> {name}: "
+                f"V {channel} {interval} | {channel} {angle} | delay={delay}"
             )
 
-            time.sleep(tiempo_total)
-        else:
-            print(f"Advertencia: paso/movimiento/acción no encontrado: {name}")
+            enviar_comando(f"V {channel} {interval}")
+            enviar_comando(f"{channel} {angle}")
+
+            SERVOS_CONFIG[channel]["interval"] = interval
+            SERVOS_CONFIG[channel]["current"] = angle
+
+            # Solo espera si tú pusiste delay manual en el JSON
+            if delay > 0:
+                time.sleep(delay)
+
+            continue
+
+        print(f"Advertencia: no encontrado en JSON: {name}")
 
 
 # ===============================
